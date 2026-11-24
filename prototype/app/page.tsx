@@ -1,40 +1,73 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { PLATFORMS, charCount, validate, type Draft, type MediaKind } from "@/lib/platforms";
-import type { PublishResult } from "@/lib/adapters";
-import type { HistoryEntry } from "@/lib/store";
+import type { Post } from "@/lib/store";
+import { Calendar } from "./components/Calendar";
 
 const box: React.CSSProperties = { background: "#fff", border: "1px solid #ddd", borderRadius: 8, padding: 16, marginBottom: 16 };
+
+// <input type="datetime-local"> wants "YYYY-MM-DDTHH:mm" in local time.
+function localInputValue(d: Date) {
+  const off = d.getTimezoneOffset() * 60_000;
+  return new Date(d.getTime() - off).toISOString().slice(0, 16);
+}
 
 export default function Home() {
   const [text, setText] = useState("");
   const [mediaKind, setMediaKind] = useState<MediaKind>("none");
   const [mediaUrl, setMediaUrl] = useState("");
   const [selected, setSelected] = useState<string[]>(["bluesky"]);
+  const [when, setWhen] = useState<"now" | "later">("now");
+  const [scheduleAt, setScheduleAt] = useState(localInputValue(new Date(Date.now() + 60 * 60_000)));
   const [busy, setBusy] = useState(false);
-  const [results, setResults] = useState<PublishResult[] | null>(null);
-  const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
+  const [posts, setPosts] = useState<Post[]>([]);
 
   const draft: Draft = { text, mediaKind, mediaUrl: mediaUrl || undefined };
-  const loadHistory = () => fetch("/api/history").then((r) => r.json()).then(setHistory);
-  useEffect(() => { loadHistory(); }, []);
 
-  const toggle = (id: string) =>
-    setSelected((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
+  const load = useCallback(() => fetch("/api/posts").then((r) => r.json()).then(setPosts), []);
 
+  // While the page is open, check for due posts every 30s. On Vercel, an
+  // external cron does this so posts go out even with the page closed.
+  useEffect(() => {
+    load();
+    const tick = () => fetch("/api/cron").then((r) => r.ok && r.json()).then((r) => r?.published && load()).catch(() => {});
+    tick();
+    const t = setInterval(tick, 30_000);
+    return () => clearInterval(t);
+  }, [load]);
+
+  const toggle = (id: string) => setSelected((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
   const blocked = selected.some((id) => validate(PLATFORMS.find((p) => p.id === id)!, draft).length);
 
-  async function post() {
+  async function submit() {
     setBusy(true);
-    setResults(null);
-    const r = await fetch("/api/publish", {
+    setMessage(null);
+    const scheduledAt = when === "later" ? new Date(scheduleAt).toISOString() : null;
+    const r = await fetch("/api/posts", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ draft, platforms: selected }),
-    }).then((r) => r.json());
-    setResults(r.results ?? [{ platform: "-", ok: false, error: r.error }]);
+      body: JSON.stringify({ draft, platforms: selected, scheduledAt }),
+    });
+    const post = await r.json();
+    if (!r.ok) setMessage({ ok: false, text: post.error });
+    else if (post.status === "scheduled")
+      setMessage({ ok: true, text: `Scheduled for ${new Date(post.scheduledAt).toLocaleString()}` });
+    else {
+      const bad = post.results.filter((x: any) => !x.ok);
+      setMessage({
+        ok: !bad.length,
+        text: bad.length ? `Failed: ${bad.map((x: any) => `${x.platform} (${x.error})`).join(", ")}` : `Posted (${post.status})`,
+      });
+    }
+    if (r.ok) setText("");
     setBusy(false);
-    loadHistory();
+    load();
+  }
+
+  async function cancel(id: string) {
+    await fetch(`/api/posts?id=${id}`, { method: "DELETE" });
+    load();
   }
 
   return (
@@ -58,12 +91,8 @@ export default function Home() {
             <option value="video">Video</option>
           </select>
           {mediaKind !== "none" && (
-            <input
-              value={mediaUrl}
-              onChange={(e) => setMediaUrl(e.target.value)}
-              placeholder="Public URL of the image/video"
-              style={{ flex: 1, minWidth: 200 }}
-            />
+            <input value={mediaUrl} onChange={(e) => setMediaUrl(e.target.value)}
+              placeholder="Public URL of the image/video" style={{ flex: 1, minWidth: 200 }} />
           )}
         </div>
       </section>
@@ -72,52 +101,40 @@ export default function Home() {
         <h3 style={{ marginTop: 0 }}>Platforms</h3>
         {PLATFORMS.map((p) => {
           const errs = validate(p, draft);
-          const on = selected.includes(p.id);
           return (
-            <label key={p.id} style={{ display: "flex", gap: 8, padding: "6px 0", borderBottom: "1px solid #eee" }}>
-              <input type="checkbox" checked={on} onChange={() => toggle(p.id)} />
-              <span style={{ width: 130 }}>{p.name}</span>
-              <span style={{ fontSize: 12, color: "#777", width: 80 }}>{p.live ? "live" : "simulated"}</span>
+            <label key={p.id} style={{ display: "flex", gap: 8, padding: "6px 0", borderBottom: "1px solid #eee", flexWrap: "wrap" }}>
+              <input type="checkbox" checked={selected.includes(p.id)} onChange={() => toggle(p.id)} />
+              <span style={{ width: 120 }}>{p.name}</span>
+              <span style={{ fontSize: 12, color: "#777", width: 70 }}>{p.live ? "live" : "simulated"}</span>
               <span style={{ fontSize: 13, color: errs.length ? "#b00020" : "#1b7f3b" }}>
                 {errs.length ? errs.join(" · ") : `OK (${charCount(text)}/${p.maxChars})`}
               </span>
             </label>
           );
         })}
-        <button
-          onClick={post}
-          disabled={busy || blocked || !selected.length}
-          style={{ marginTop: 12, padding: "10px 20px", fontSize: 16, cursor: "pointer" }}
-        >
-          {busy ? "Posting..." : `Post to ${selected.length} platform${selected.length === 1 ? "" : "s"}`}
+
+        <div style={{ marginTop: 12, display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+          <label><input type="radio" checked={when === "now"} onChange={() => setWhen("now")} /> Post now</label>
+          <label><input type="radio" checked={when === "later"} onChange={() => setWhen("later")} /> Schedule</label>
+          {when === "later" && (
+            <input type="datetime-local" value={scheduleAt} min={localInputValue(new Date())}
+              onChange={(e) => setScheduleAt(e.target.value)} />
+          )}
+        </div>
+
+        <button onClick={submit} disabled={busy || blocked || !selected.length}
+          style={{ marginTop: 12, padding: "10px 20px", fontSize: 16, cursor: "pointer" }}>
+          {busy ? "Working..." : when === "now"
+            ? `Post to ${selected.length} platform${selected.length === 1 ? "" : "s"}`
+            : "Schedule post"}
         </button>
         {blocked && <div style={{ color: "#b00020", fontSize: 13, marginTop: 6 }}>Fix the errors on checked platforms first.</div>}
+        {message && <div style={{ marginTop: 8, color: message.ok ? "#1b7f3b" : "#b00020" }}>{message.text}</div>}
       </section>
 
-      {results && (
-        <section style={box}>
-          <h3 style={{ marginTop: 0 }}>Results</h3>
-          {results.map((r) => (
-            <div key={r.platform}>
-              {r.ok ? "✅" : "❌"} {r.platform}
-              {r.simulated && " (simulated)"}
-              {r.url && <> — <a href={r.url} target="_blank">view post</a></>}
-              {r.error && <span style={{ color: "#b00020" }}> — {r.error}</span>}
-            </div>
-          ))}
-        </section>
-      )}
-
       <section style={box}>
-        <h3 style={{ marginTop: 0 }}>History</h3>
-        {!history.length && <div style={{ color: "#777" }}>Nothing posted yet.</div>}
-        {history.map((h) => (
-          <div key={h.id} style={{ borderBottom: "1px solid #eee", padding: "8px 0", fontSize: 14 }}>
-            <div style={{ color: "#777" }}>{new Date(h.at).toLocaleString()}</div>
-            <div>{h.draft.text.slice(0, 120) || "(media only)"}</div>
-            <div>{h.results.map((r) => `${r.ok ? "✅" : "❌"} ${r.platform}`).join("  ")}</div>
-          </div>
-        ))}
+        <h3 style={{ marginTop: 0 }}>Calendar</h3>
+        <Calendar posts={posts} onCancel={cancel} />
       </section>
     </main>
   );
