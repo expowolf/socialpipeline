@@ -15,3 +15,10 @@ create index if not exists posts_due_idx on public.posts (scheduled_at) where st
 -- Lock the table: with RLS on and no policies, the public "anon" key can't read
 -- or write it. The app's server uses the service-role key, which bypasses RLS.
 alter table public.posts enable row level security;
+
+-- Public bucket for uploaded photos/videos. Public so Instagram/TikTok/etc. can
+-- fetch them by URL when publishing. Paths start with a random UUID, so they
+-- can't be guessed. 50 MB is the free-plan per-file cap.
+insert into storage.buckets (id, name, public, file_size_limit)
+values ('media', 'media', true, 52428800)
+on conflict (id) do nothing;

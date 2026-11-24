@@ -1,15 +1,15 @@
 import { publish } from "./adapters";
-import { PLATFORMS, validate } from "./platforms";
-import { store, type Post, type PostStatus } from "./store";
+import { captionFor, platformById, validate, type Draft } from "./platforms";
+import { store, type PostStatus } from "./store";
 
-export async function publishPost(post: Pick<Post, "platforms" | "draft">) {
+export async function publishPost(post: { platforms: string[]; draft: Draft }) {
   return Promise.all(
     post.platforms.map(async (id) => {
-      const p = PLATFORMS.find((x) => x.id === id);
+      const p = platformById(id);
       if (!p) return { platform: id, ok: false, error: "Unknown platform" };
       const errs = validate(p, post.draft);
       if (errs.length) return { platform: id, ok: false, error: errs.join("; ") };
-      return publish(id, post.draft);
+      return publish(id, { caption: captionFor(post.draft, id), media: post.draft.media });
     })
   );
 }

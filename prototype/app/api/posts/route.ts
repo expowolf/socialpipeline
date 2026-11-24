@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { PLATFORMS, validate, type Draft } from "@/lib/platforms";
+import { platformById, validate, type Draft } from "@/lib/platforms";
 import { publishPost, statusFrom } from "@/lib/runner";
 import { store, type Post } from "@/lib/store";
 
@@ -16,11 +16,12 @@ export async function POST(req: Request) {
     platforms: string[];
     scheduledAt?: string | null;
   };
+  if (!draft || !Array.isArray(draft.media)) return NextResponse.json({ error: "Bad request" }, { status: 400 });
   if (!platforms?.length) return NextResponse.json({ error: "Pick at least one platform" }, { status: 400 });
 
   // Validate up front so a scheduled post can't fail later for a fixable reason.
   const errors = platforms.flatMap((id) => {
-    const p = PLATFORMS.find((x) => x.id === id);
+    const p = platformById(id);
     const errs = p ? validate(p, draft) : ["Unknown platform"];
     return errs.map((e) => `${p?.name ?? id}: ${e}`);
   });

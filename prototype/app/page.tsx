@@ -1,141 +1,121 @@
 "use client";
-import { useCallback, useEffect, useState } from "react";
-import { PLATFORMS, charCount, validate, type Draft, type MediaKind } from "@/lib/platforms";
-import type { Post } from "@/lib/store";
-import { Calendar } from "./components/Calendar";
+import { useMemo, useState } from "react";
+import { Loader2, Send, CalendarClock } from "lucide-react";
+import { toast } from "sonner";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { MediaDropzone, type UploadingItem } from "@/components/composer/media-dropzone";
+import { PlatformChecklist } from "@/components/composer/platform-checklist";
+import { CaptionEditor } from "@/components/composer/caption-editor";
+import { SchedulePicker, scheduleToDate, type Schedule } from "@/components/composer/schedule-picker";
+import { platformById, validate, type Draft, type MediaItem } from "@/lib/platforms";
 
-const box: React.CSSProperties = { background: "#fff", border: "1px solid #ddd", borderRadius: 8, padding: 16, marginBottom: 16 };
-
-// <input type="datetime-local"> wants "YYYY-MM-DDTHH:mm" in local time.
-function localInputValue(d: Date) {
-  const off = d.getTimezoneOffset() * 60_000;
-  return new Date(d.getTime() - off).toISOString().slice(0, 16);
+function defaultSchedule(): Schedule {
+  const d = new Date(Date.now() + 60 * 60_000); // an hour from now
+  return { mode: "now", date: d, time: `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}` };
 }
 
-export default function Home() {
-  const [text, setText] = useState("");
-  const [mediaKind, setMediaKind] = useState<MediaKind>("none");
-  const [mediaUrl, setMediaUrl] = useState("");
-  const [selected, setSelected] = useState<string[]>(["bluesky"]);
-  const [when, setWhen] = useState<"now" | "later">("now");
-  const [scheduleAt, setScheduleAt] = useState(localInputValue(new Date(Date.now() + 60 * 60_000)));
+export default function CreatePage() {
+  const [uploads, setUploads] = useState<UploadingItem[]>([]);
+  const [text, setText] = useState<Pick<Draft, "caption" | "captions">>({ caption: "" });
+  const [selected, setSelected] = useState<string[]>(["instagram", "tiktok"]);
+  const [schedule, setSchedule] = useState<Schedule>(defaultSchedule);
   const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
-  const [posts, setPosts] = useState<Post[]>([]);
 
-  const draft: Draft = { text, mediaKind, mediaUrl: mediaUrl || undefined };
+  const draft: Draft = useMemo(
+    () => ({
+      ...text,
+      media: uploads.map(({ url, kind, name, size, type }) => ({ url: url ?? "", kind, name, size: size ?? 0, type: type ?? "" }) as MediaItem),
+    }),
+    [text, uploads]
+  );
 
-  const load = useCallback(() => fetch("/api/posts").then((r) => r.json()).then(setPosts), []);
+  const uploading = uploads.some((u) => u.status === "uploading");
+  const failedUpload = uploads.some((u) => u.status === "error");
+  const problems = selected.flatMap((id) => validate(platformById(id)!, draft).map((e) => `${platformById(id)!.name}: ${e}`));
+  const when = schedule.mode === "later" ? scheduleToDate(schedule) : null;
+  const inPast = when !== null && when.getTime() < Date.now();
 
-  // While the page is open, check for due posts every 30s. On Vercel, an
-  // external cron does this so posts go out even with the page closed.
-  useEffect(() => {
-    load();
-    const tick = () => fetch("/api/cron").then((r) => r.ok && r.json()).then((r) => r?.published && load()).catch(() => {});
-    tick();
-    const t = setInterval(tick, 30_000);
-    return () => clearInterval(t);
-  }, [load]);
-
-  const toggle = (id: string) => setSelected((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
-  const blocked = selected.some((id) => validate(PLATFORMS.find((p) => p.id === id)!, draft).length);
+  const blocker =
+    !selected.length ? "Pick at least one platform"
+    : uploading ? "Waiting for uploads to finish…"
+    : failedUpload ? "Remove the failed upload"
+    : problems[0] ?? (inPast ? "Pick a time in the future" : null);
 
   async function submit() {
     setBusy(true);
-    setMessage(null);
-    const scheduledAt = when === "later" ? new Date(scheduleAt).toISOString() : null;
-    const r = await fetch("/api/posts", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ draft, platforms: selected, scheduledAt }),
-    });
-    const post = await r.json();
-    if (!r.ok) setMessage({ ok: false, text: post.error });
-    else if (post.status === "scheduled")
-      setMessage({ ok: true, text: `Scheduled for ${new Date(post.scheduledAt).toLocaleString()}` });
-    else {
-      const bad = post.results.filter((x: any) => !x.ok);
-      setMessage({
-        ok: !bad.length,
-        text: bad.length ? `Failed: ${bad.map((x: any) => `${x.platform} (${x.error})`).join(", ")}` : `Posted (${post.status})`,
+    try {
+      const res = await fetch("/api/posts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ draft, platforms: selected, scheduledAt: when?.toISOString() ?? null }),
       });
+      const post = await res.json();
+      if (!res.ok) throw new Error(post.error);
+      if (post.status === "scheduled") {
+        toast.success(`Scheduled for ${new Date(post.scheduledAt).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })}`);
+      } else {
+        const bad = post.results.filter((r: any) => !r.ok);
+        if (bad.length) toast.error(`Failed on ${bad.map((r: any) => `${platformById(r.platform)?.name}: ${r.error}`).join("; ")}`);
+        else toast.success(`Posted to ${post.results.length} platform${post.results.length > 1 ? "s" : ""}`);
+      }
+      setUploads([]);
+      setText({ caption: "" });
+      window.dispatchEvent(new Event("posts-changed"));
+    } catch (e: any) {
+      toast.error(e.message);
+    } finally {
+      setBusy(false);
     }
-    if (r.ok) setText("");
-    setBusy(false);
-    load();
-  }
-
-  async function cancel(id: string) {
-    await fetch(`/api/posts?id=${id}`, { method: "DELETE" });
-    load();
   }
 
   return (
-    <main style={{ maxWidth: 760, margin: "0 auto", padding: 16 }}>
-      <h1 style={{ marginBottom: 4 }}>SocialPipeline</h1>
-      <p style={{ marginTop: 0, color: "#555" }}>Write once, post everywhere. Prototype.</p>
+    <div className="grid gap-6 lg:grid-cols-[1fr_380px]">
+      <div className="space-y-6">
+        <Card>
+          <CardHeader>
+            <CardTitle>Media</CardTitle>
+            <CardDescription>Upload the photos or video you want to post.</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <MediaDropzone items={uploads} setItems={setUploads} />
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader>
+            <CardTitle>Caption</CardTitle>
+            <CardDescription>What do you want to say with this post?</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <CaptionEditor draft={draft} setDraft={(d) => setText({ caption: d.caption, captions: d.captions })} selected={selected} />
+          </CardContent>
+        </Card>
+      </div>
 
-      <section style={box}>
-        <textarea
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          placeholder="What do you want to post?"
-          rows={6}
-          style={{ width: "100%", boxSizing: "border-box", fontSize: 16, padding: 8 }}
-        />
-        <div style={{ color: "#555", fontSize: 14 }}>{charCount(text)} characters</div>
-        <div style={{ marginTop: 12, display: "flex", gap: 8, flexWrap: "wrap" }}>
-          <select value={mediaKind} onChange={(e) => setMediaKind(e.target.value as MediaKind)}>
-            <option value="none">No media</option>
-            <option value="image">Image</option>
-            <option value="video">Video</option>
-          </select>
-          {mediaKind !== "none" && (
-            <input value={mediaUrl} onChange={(e) => setMediaUrl(e.target.value)}
-              placeholder="Public URL of the image/video" style={{ flex: 1, minWidth: 200 }} />
-          )}
-        </div>
-      </section>
-
-      <section style={box}>
-        <h3 style={{ marginTop: 0 }}>Platforms</h3>
-        {PLATFORMS.map((p) => {
-          const errs = validate(p, draft);
-          return (
-            <label key={p.id} style={{ display: "flex", gap: 8, padding: "6px 0", borderBottom: "1px solid #eee", flexWrap: "wrap" }}>
-              <input type="checkbox" checked={selected.includes(p.id)} onChange={() => toggle(p.id)} />
-              <span style={{ width: 120 }}>{p.name}</span>
-              <span style={{ fontSize: 12, color: "#777", width: 70 }}>{p.live ? "live" : "simulated"}</span>
-              <span style={{ fontSize: 13, color: errs.length ? "#b00020" : "#1b7f3b" }}>
-                {errs.length ? errs.join(" · ") : `OK (${charCount(text)}/${p.maxChars})`}
-              </span>
-            </label>
-          );
-        })}
-
-        <div style={{ marginTop: 12, display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-          <label><input type="radio" checked={when === "now"} onChange={() => setWhen("now")} /> Post now</label>
-          <label><input type="radio" checked={when === "later"} onChange={() => setWhen("later")} /> Schedule</label>
-          {when === "later" && (
-            <input type="datetime-local" value={scheduleAt} min={localInputValue(new Date())}
-              onChange={(e) => setScheduleAt(e.target.value)} />
-          )}
-        </div>
-
-        <button onClick={submit} disabled={busy || blocked || !selected.length}
-          style={{ marginTop: 12, padding: "10px 20px", fontSize: 16, cursor: "pointer" }}>
-          {busy ? "Working..." : when === "now"
-            ? `Post to ${selected.length} platform${selected.length === 1 ? "" : "s"}`
-            : "Schedule post"}
-        </button>
-        {blocked && <div style={{ color: "#b00020", fontSize: 13, marginTop: 6 }}>Fix the errors on checked platforms first.</div>}
-        {message && <div style={{ marginTop: 8, color: message.ok ? "#1b7f3b" : "#b00020" }}>{message.text}</div>}
-      </section>
-
-      <section style={box}>
-        <h3 style={{ marginTop: 0 }}>Calendar</h3>
-        <Calendar posts={posts} onCancel={cancel} />
-      </section>
-    </main>
+      <div className="space-y-6 lg:sticky lg:top-20 lg:self-start">
+        <Card>
+          <CardHeader>
+            <CardTitle>Post to</CardTitle>
+            <CardDescription>{selected.length} of 9 selected</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <PlatformChecklist draft={draft} selected={selected} setSelected={setSelected} />
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader>
+            <CardTitle>When</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <SchedulePicker value={schedule} onChange={setSchedule} />
+            <Button className="h-11 w-full text-base" disabled={busy || !!blocker} onClick={submit}>
+              {busy ? <Loader2 className="size-4 animate-spin" /> : schedule.mode === "now" ? <Send className="size-4" /> : <CalendarClock className="size-4" />}
+              {schedule.mode === "now" ? "Post now" : "Schedule post"}
+            </Button>
+            {blocker && <p className="text-center text-xs text-muted-foreground">{blocker}</p>}
+          </CardContent>
+        </Card>
+      </div>
+    </div>
   );
 }
